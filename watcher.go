@@ -3,7 +3,6 @@ package watcher
 import (
 	"context"
 	"fmt"
-	"github.com/casbin/casbin/persist"
 	"github.com/tryfix/kstream/consumer"
 	"github.com/tryfix/kstream/data"
 	"github.com/tryfix/log"
@@ -11,19 +10,18 @@ import (
 	"sync"
 )
 
-// Check interface compatibility
-var _ persist.Watcher = &Watcher{}
-
 // Watcher implements casbin policy update watcher
 type Watcher struct {
 	ctx      context.Context
 	connMu   *sync.RWMutex
-	consumer consumer.Consumer
+	consumer consumer.PartitionConsumer
+	//consumer consumer.Consumer
 	*config
 }
 
 type config struct {
 	topic        string
+	synced       chan bool
 	brokers      []string
 	logger       log.Logger
 	callbackFunc ExecuteFunc
@@ -61,6 +59,7 @@ func NewConfig(topic string, brokers []string, callbackFunc ExecuteFunc) *config
 	c.topic = topic
 	c.brokers = brokers
 	c.callbackFunc = callbackFunc
+	c.synced = make(chan bool, 1)
 	return c
 }
 
@@ -79,13 +78,12 @@ func New(ctx context.Context, cfg *config) (*Watcher, error) {
 	runtime.SetFinalizer(w, finalizer)
 
 	//w.producer = NewProducer(cfg.brokers, cfg.logger)
-	w.consumer = newConsumer(cfg.brokers, cfg.logger)
+	w.consumer = newPartitionConsumer(cfg.brokers, cfg.logger)
 	_ = w.setUpdateCallback(cfg.callbackFunc)
 
-	err := w.Subscribe()
-	if err != nil {
-		return nil, err
-	}
+	go w.Subscribe(w.config.synced)
+
+	<-w.config.synced
 
 	return w, nil
 }
@@ -96,24 +94,6 @@ func (w *Watcher) setUpdateCallback(callbackFunc ExecuteFunc) error {
 		defer w.connMu.RUnlock()
 		return callbackFunc(record)
 	}
-	return nil
-}
-
-// Deprecated
-// SetUpdateCallback sets the callback function that the watcher will call
-// when the policy in DB has been changed by other instances.
-// A classic callback is Enforcer.LoadPolicy().
-func (w *Watcher) SetUpdateCallback(f func(string)) error {
-	panic(`this watcher is using setUpdateCallback function to use full functionality of Kafka topics`)
-}
-
-// Update calls the update callback of other instances to synchronize their policy.
-// It is usually called after changing the policy in DB, like Enforcer.SavePolicy(),
-// Enforcer.AddPolicy(), Enforcer.RemovePolicy(), etc.
-func (w *Watcher) Update() error {
-	// All applications are synced through the kafka topic.
-	// It's not required to inform instances that
-	// the policies has been updated.
 	return nil
 }
 
@@ -136,23 +116,26 @@ func finalizer(w *Watcher) {
 
 // Subscribe function will listen to all incoming messages from provided kafka topic
 // and will call callbackFunc on each message.
-func (w *Watcher) Subscribe() error {
-	partitions, err := w.consumer.Consume([]string{w.topic}, rebalancedHandler{})
+func (w *Watcher) Subscribe(synced chan<- bool) {
+	// If needed to use multiple partitions
+	// client, err := sarama.NewClient(w.brokers, sarama.NewConfig())
+	// p, err := client.Partitions(w.topic)
+
+	partition, err := w.consumer.Consume(w.topic, 0, consumer.Earliest)
 	if err != nil {
-		return err
+		w.logger.Fatal(err)
 	}
-	for p := range partitions {
-		go func(pt consumer.Partition) {
-			for record := range pt.Records() {
-				err := w.callbackFunc(record)
-				if err != nil {
-					w.logger.Error(fmt.Errorf(`error executing the message processor func, err:%v`, err))
-					continue
-				}
-				// messages are not committed since on restart application need to build the latest
-				// policy state from the messages
+	for event := range partition {
+		switch record := event.(type) {
+		case *data.Record:
+			err := w.callbackFunc(record)
+			if err != nil {
+				w.logger.Error(fmt.Errorf(`error executing the message processor func, err:%v`, err))
+				continue
 			}
-		}(p)
+		case *consumer.PartitionEnd:
+			synced <- true
+		}
+
 	}
-	return nil
 }

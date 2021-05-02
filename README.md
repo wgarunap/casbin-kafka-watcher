@@ -12,6 +12,8 @@ Influenced by https://github.com/rusenask/casbin-go-cloud-watcher
 ```shell
 go get -u github.com/wgarunap/casbin-kafka-watcher
 ```
+### Architecture
+![Casbin kafka watcher architecture diagram and message structure](doc.svg)
 
 ### Usage
 
